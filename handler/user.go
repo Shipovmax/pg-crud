@@ -3,11 +3,15 @@ package handler
 import (
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
+	"regexp"
 	"strconv"
 
 	"pg-crud/repository"
 )
+
+var emailRE = regexp.MustCompile(`^[^\s@]+@[^\s@]+\.[^\s@]+$`)
 
 // UserHandler handles HTTP requests for the users resource.
 type UserHandler struct {
@@ -39,8 +43,8 @@ func (h *UserHandler) Create(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "name is required")
 		return
 	}
-	if req.Email == "" {
-		writeError(w, http.StatusBadRequest, "email is required")
+	if !emailRE.MatchString(req.Email) {
+		writeError(w, http.StatusBadRequest, "email is invalid")
 		return
 	}
 
@@ -50,6 +54,7 @@ func (h *UserHandler) Create(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusConflict, "email already exists")
 			return
 		}
+		log.Printf("create user: %v", err)
 		writeError(w, http.StatusServiceUnavailable, "service unavailable")
 		return
 	}
@@ -70,6 +75,7 @@ func (h *UserHandler) GetByID(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "user not found")
 			return
 		}
+		log.Printf("get user: %v", err)
 		writeError(w, http.StatusServiceUnavailable, "service unavailable")
 		return
 	}
@@ -80,6 +86,7 @@ func (h *UserHandler) GetByID(w http.ResponseWriter, r *http.Request) {
 func (h *UserHandler) List(w http.ResponseWriter, r *http.Request) {
 	users, err := h.repo.List(r.Context())
 	if err != nil {
+		log.Printf("list users: %v", err)
 		writeError(w, http.StatusServiceUnavailable, "service unavailable")
 		return
 	}
@@ -103,8 +110,8 @@ func (h *UserHandler) Update(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "name is required")
 		return
 	}
-	if req.Email == "" {
-		writeError(w, http.StatusBadRequest, "email is required")
+	if !emailRE.MatchString(req.Email) {
+		writeError(w, http.StatusBadRequest, "email is invalid")
 		return
 	}
 
@@ -118,6 +125,7 @@ func (h *UserHandler) Update(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusConflict, "email already exists")
 			return
 		}
+		log.Printf("update user: %v", err)
 		writeError(w, http.StatusServiceUnavailable, "service unavailable")
 		return
 	}
@@ -137,6 +145,7 @@ func (h *UserHandler) Delete(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "user not found")
 			return
 		}
+		log.Printf("delete user: %v", err)
 		writeError(w, http.StatusServiceUnavailable, "service unavailable")
 		return
 	}
