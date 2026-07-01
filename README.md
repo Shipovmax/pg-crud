@@ -1,6 +1,6 @@
 # pg-crud — PostgreSQL CRUD Service
 
-> HTTP REST сервис с полноценной работой с PostgreSQL: пул соединений, миграции, транзакции. Project #7 в Go backend roadmap — первое знакомство с persistent storage.
+> HTTP REST service featuring comprehensive PostgreSQL integration: connection pooling, migrations, and transactions. Project #7 in the Go backend roadmap — first hands-on experience with persistent storage.
 
 ---
 
@@ -8,27 +8,27 @@
 
 ### What this is and why
 
-pg-crud — HTTP сервис для управления сущностями (users) с хранением данных в PostgreSQL. Проект #7 следует за in-memory kv-store (#6) и впервые вводит persistent storage с production-grade подходом: connection pool через `pgxpool`, SQL-миграции как код, явные транзакции там где нужна атомарность.
+pg-crud is an HTTP service for managing entity records (users) backed by PostgreSQL. Following the in-memory kv-store (#6), Project #7 introduces persistent storage with a production-grade setup: connection pooling via `pgxpool`, raw SQL migrations, and explicit transaction management where atomicity is required.
 
-Это именно тот проект, где большинство junior-разработчиков делают критические ошибки: открывают новое соединение на каждый запрос, игнорируют rollback при ошибке, смешивают SQL с бизнес-логикой. Здесь всё разделено: repository слой изолирует SQL, handler слой — HTTP, main.go только wire-up.
+This is exactly the type of project where most junior developers make critical mistakes: opening a new connection per request, ignoring rollback logic on errors, or bleeding SQL queries into business logic. Here, layers are strictly isolated: the repository layer encapsulates raw SQL, handlers deal exclusively with HTTP, and `main.go` only acts as wire-up.
 
 ### What this project demonstrates
 
 | Skill | Implementation |
 |-------|---------------|
-| Connection pooling | `pgxpool.New` с настройкой `MaxConns`, `MinConns` |
-| SQL migrations | `golang-migrate/migrate` — up/down файлы, версионирование схемы |
-| Transactions | `pool.Begin()` → defer rollback → explicit commit |
-| Repository pattern | SQL изолирован в `repository/`, handler не знает про SQL |
-| Error handling | `pgx.ErrNoRows` → 404, constraint violations → 409 |
-| Graceful shutdown | `http.Server.Shutdown` + закрытие пула соединений |
-| Environment config | DSN через переменные окружения, не хардкод |
+| Connection pooling | `pgxpool.New` with tuned `MaxConns` and `MinConns` configurations |
+| SQL migrations | `golang-migrate/migrate` — up/down SQL files with schema versioning |
+| Transactions | `pool.Begin()` → defer rollback → explicit commit pattern |
+| Repository pattern | SQL execution isolated in `repository/`; handlers remain agnostic to database queries |
+| Error handling | Proper mapping: `pgx.ErrNoRows` → 404, constraint violations → 409 Conflict |
+| Graceful shutdown | `http.Server.Shutdown` paired with clean connection pool termination |
+| Environment config | DSN management using environment variables instead of hardcoded strings |
 
 ### Stack
 
 - Language: Go 1.23
 - Dependencies: `pgx/v5`, `golang-migrate/migrate/v4`
-- Infrastructure: PostgreSQL 16, Docker (для локального запуска БД)
+- Infrastructure: PostgreSQL 16, Docker (for local database instance)
 - Platform: Linux/macOS
 
 ---
@@ -37,96 +37,104 @@ pg-crud — HTTP сервис для управления сущностями (
 
 ### Architectural decisions
 
-#### WHY pgxpool, не database/sql
+#### WHY pgxpool over database/sql
 
-`database/sql` — абстракция для любых драйверов. `pgxpool` — нативный PostgreSQL пул с поддержкой PG-специфичных типов (pgtype), LISTEN/NOTIFY, копирования. На production Go+Postgres всегда pgx. `database/sql` нужен когда требуется совместимость с несколькими СУБД.
+`database/sql` is a generalized abstraction designed to work with any database driver. In contrast, `pgxpool` is a native PostgreSQL pool that offers out-of-the-box support for PostgreSQL-specific data types (`pgtype`), LISTEN/NOTIFY commands, and binary data copying. For production-grade Go+Postgres services, `pgx` is the industry standard. `database/sql` is only necessary when seamless compatibility with multiple relational database engines is required.
 
-#### WHY golang-migrate, не руками
+#### WHY golang-migrate over inline SQL execution
 
-SQL в `db.Exec` при старте приложения — антипаттерн: нет версионирования, нет rollback, нет воспроизводимости. `golang-migrate` даёт нумерованные `up`/`down` файлы, чистую историю изменений схемы, возможность откатиться. Это стандарт в продакшене.
+Executing raw SQL strings directly within `db.Exec` upon application startup is a major anti-pattern: it lacks schema versioning, automated rollback capability, and environment reproducibility. `golang-migrate` addresses this by providing sequentially numbered `up` and `down` migration files, ensuring a transparent schema history and the ability to roll back changes cleanly. This is standard practice in production environments.
 
-#### WHY repository pattern
+#### WHY the repository pattern
 
-Handler не должен знать про SQL. Repository — единственное место где есть `pgxpool.Pool` и SQL-строки. Handler работает через интерфейс `UserRepository`. Это даёт: тестируемость (mock репозиторий), независимость слоёв, возможность поменять хранилище без переписывания HTTP слоя.
+HTTP handlers should have no awareness of raw SQL queries. The repository layer is designed as the sole domain containing the `pgxpool.Pool` and raw SQL statement strings. Handlers interact with this layer strictly through the `UserRepository` interface. This architecture provides excellent testability (via mock repositories), absolute decoupling between business logic and storage, and the flexibility to switch database backends without modifying the HTTP transport layer.
 
 #### WHY defer tx.Rollback()
 
 ```go
 tx, _ := pool.Begin(ctx)
-defer tx.Rollback(ctx) // no-op если уже был Commit
-// ... операции ...
+defer tx.Rollback(ctx) // no-op if Commit has already been executed
+// ... database operations ...
 tx.Commit(ctx)
+
 ```
 
-`Rollback` после `Commit` — безопасный no-op. Паттерн гарантирует что при любой ошибке транзакция будет откачена, даже если забыть явный rollback.
+Calling `Rollback` after a successful `Commit` is a completely safe no-op operation. Utilizing this pattern guarantees that if an error or panic occurs midway through execution, the transaction will automatically roll back, preventing partial data state updates even if an explicit rollback statement was missed.
 
 ### Structure
 
 ```
 pg-crud/
-├── main.go                    # wire-up: pool, migrations, server, shutdown
+├── main.go            # wire-up: pool initialization, migrations, server startup, and graceful shutdown
 ├── config/
-│   └── config.go              # читает env vars, возвращает Config struct
+│   └── config.go      # parses environment variables into a structured Config object
 ├── repository/
-│   └── user.go                # SQL: Create, GetByID, List, Update, Delete
+│   └── user.go        # SQL operations: Create, GetByID, List, Update, Delete
 ├── handler/
-│   └── user.go                # HTTP handlers, зависят от UserRepository interface
+│   └── user.go        # HTTP handlers decoupled via the UserRepository interface
 ├── migrations/
 │   ├── 000001_create_users.up.sql
 │   └── 000001_create_users.down.sql
-├── docker-compose.yml         # PostgreSQL 16 локально
+├── docker-compose.yml # localized PostgreSQL 16 infrastructure setup
 ├── README.md
 └── task.md
+
 ```
 
 ### Setup and run
 
 ```bash
-# Поднять PostgreSQL
+# Spin up PostgreSQL instance
 docker compose up -d
 
-# Запустить сервис
+# Spin up the service
 DATABASE_URL="postgres://postgres:postgres@localhost:5432/pgcrud?sslmode=disable" \
 go run ./...
+
 ```
 
 ### Usage
 
 ```bash
-# Создать пользователя
+# Create a user
 curl -X POST http://localhost:8080/users \
   -H "Content-Type: application/json" \
   -d '{"name":"Alice","email":"alice@example.com"}'
 
-# Получить пользователя
+# Get a user by ID
 curl http://localhost:8080/users/1
 
-# Список всех
+# List all users
 curl http://localhost:8080/users
 
-# Обновить
+# Update a user
 curl -X PUT http://localhost:8080/users/1 \
+  -H "Content-Type: application/json" \
   -d '{"name":"Alice Updated","email":"alice@example.com"}'
 
-# Удалить
+# Delete a user
 curl -X DELETE http://localhost:8080/users/1
+
 ```
 
 ### Examples
 
 ```bash
 $ curl -X POST http://localhost:8080/users \
+  -H "Content-Type: application/json" \
   -d '{"name":"Bob","email":"bob@example.com"}'
-{"id":1,"name":"Bob","email":"bob@example.com","created_at":"2025-01-01T12:00:00Z"}
+{"id":1,"name":"Bob","email":"bob@example.com","created_at":"2026-01-01T12:00:00Z"}
 
 $ curl http://localhost:8080/users/999
 {"error":"user not found"}
-# HTTP 404
+# HTTP 404 Not Found
 
 $ curl -X POST http://localhost:8080/users \
+  -H "Content-Type: application/json" \
   -d '{"name":"Bob2","email":"bob@example.com"}'
 {"error":"email already exists"}
-# HTTP 409
+# HTTP 409 Conflict
+
 ```
 
 ### Error handling
@@ -135,17 +143,18 @@ $ curl -X POST http://localhost:8080/users \
 # Not found
 GET /users/999 → 404 {"error":"user not found"}
 
-# Duplicate email (unique constraint)
+# Duplicate email (unique constraint violation)
 POST /users (existing email) → 409 {"error":"email already exists"}
 
-# Invalid JSON
-POST /users (bad body) → 400 {"error":"invalid request body"}
+# Invalid JSON payload
+POST /users (malformed body) → 400 {"error":"invalid request body"}
 
-# Missing required field
-POST /users (no email) → 400 {"error":"email is required"}
+# Missing required validation fields
+POST /users (empty email) → 400 {"error":"email is required"}
 
-# DB unavailable
+# Database connectivity failure
 any request → 503 {"error":"service unavailable"}
+
 ```
 
 ### Run without build
@@ -153,4 +162,6 @@ any request → 503 {"error":"service unavailable"}
 ```bash
 DATABASE_URL="postgres://postgres:postgres@localhost:5432/pgcrud?sslmode=disable" \
 go run ./...
+
 ```
+
