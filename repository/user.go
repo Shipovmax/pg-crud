@@ -23,6 +23,11 @@ var (
 	ErrDuplicateEmail = errors.New("email already exists")
 )
 
+// queryTimeout bounds each database round-trip independently of the
+// caller's context, so a stuck lock or slow plan can't hang a request
+// past this deadline even if the client keeps the connection open.
+const queryTimeout = 5 * time.Second
+
 // UserRepository defines the persistence operations available for users.
 type UserRepository interface {
 	Create(ctx context.Context, name, email string) (*User, error)
@@ -44,14 +49,11 @@ func NewUserRepository(pool *pgxpool.Pool) UserRepository {
 func (r *pgUserRepository) Create(ctx context.Context, name, email string) (*User, error) {
 	const q = `INSERT INTO users (name, email) VALUES ($1, $2) RETURNING id, name, email, created_at`
 
-	tx, err := r.pool.Begin(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback(ctx)
+	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
+	defer cancel()
 
 	u := &User{}
-	err = tx.QueryRow(ctx, q, name, email).Scan(&u.ID, &u.Name, &u.Email, &u.CreatedAt)
+	err := r.pool.QueryRow(ctx, q, name, email).Scan(&u.ID, &u.Name, &u.Email, &u.CreatedAt)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
@@ -59,15 +61,14 @@ func (r *pgUserRepository) Create(ctx context.Context, name, email string) (*Use
 		}
 		return nil, err
 	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return nil, err
-	}
 	return u, nil
 }
 
 func (r *pgUserRepository) GetByID(ctx context.Context, id int64) (*User, error) {
 	const q = `SELECT id, name, email, created_at FROM users WHERE id = $1`
+
+	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
+	defer cancel()
 
 	u := &User{}
 	err := r.pool.QueryRow(ctx, q, id).Scan(&u.ID, &u.Name, &u.Email, &u.CreatedAt)
@@ -82,6 +83,9 @@ func (r *pgUserRepository) GetByID(ctx context.Context, id int64) (*User, error)
 
 func (r *pgUserRepository) List(ctx context.Context) ([]*User, error) {
 	const q = `SELECT id, name, email, created_at FROM users ORDER BY id`
+
+	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
+	defer cancel()
 
 	rows, err := r.pool.Query(ctx, q)
 	if err != nil {
@@ -106,6 +110,9 @@ func (r *pgUserRepository) List(ctx context.Context) ([]*User, error) {
 func (r *pgUserRepository) Update(ctx context.Context, id int64, name, email string) (*User, error) {
 	const q = `UPDATE users SET name = $1, email = $2 WHERE id = $3 RETURNING id, name, email, created_at`
 
+	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
+	defer cancel()
+
 	u := &User{}
 	err := r.pool.QueryRow(ctx, q, name, email, id).Scan(&u.ID, &u.Name, &u.Email, &u.CreatedAt)
 	if err != nil {
@@ -123,6 +130,9 @@ func (r *pgUserRepository) Update(ctx context.Context, id int64, name, email str
 
 func (r *pgUserRepository) Delete(ctx context.Context, id int64) error {
 	const q = `DELETE FROM users WHERE id = $1`
+
+	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
+	defer cancel()
 
 	tag, err := r.pool.Exec(ctx, q, id)
 	if err != nil {

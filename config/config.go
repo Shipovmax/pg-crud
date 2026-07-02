@@ -2,7 +2,9 @@ package config
 
 import (
 	"errors"
+	"fmt"
 	"os"
+	"strconv"
 )
 
 // Config holds application settings loaded from environment variables.
@@ -24,9 +26,18 @@ func Load() (*Config, error) {
 		addr = ":8080"
 	}
 
+	poolMaxConns := int32(10)
+	if v := os.Getenv("POOL_MAX_CONNS"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 32)
+		if err != nil || n <= 0 {
+			return nil, fmt.Errorf("POOL_MAX_CONNS must be a positive integer: %q", v)
+		}
+		poolMaxConns = int32(n)
+	}
+
 	return &Config{
 		DatabaseURL:  dsn,
 		ServerAddr:   addr,
-		PoolMaxConns: 10,
+		PoolMaxConns: poolMaxConns,
 	}, nil
 }
