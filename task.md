@@ -1,26 +1,24 @@
-# Task #7 — PostgreSQL CRUD
+# Task #9 — Redis Cache Layer (pg-crud)
 
 ## Цель
 
-Написать HTTP REST сервис с полноценной работой с PostgreSQL: connection pool через pgxpool, SQL-миграции через golang-migrate, транзакции, repository pattern. Главная учебная цель — научиться правильно организовывать слой работы с БД: SQL изолирован в repository, handler не знает про pgx, миграции как версионированный код.
+Добавить cache-aside слой на Redis поверх `pg-crud`, не трогая `pgUserRepository` и не протекая абстракцией в `handler`. Учебная цель — не "прикрутить редис", а разобраться с реальными проблемами кэширования: **cache stampede**, **инвалидация после записи**, **fail-open деградация** и **circuit breaker** на внешнюю зависимость, которая может лечь под нагрузкой. Задача блокируется незакрытым техдолгом — `List()` без пагинации не имеет права на кэш, пока не ограничена по объёму.
 
 ---
 
 ## Acceptance Criteria
 
-- [ ] `POST /users` создаёт пользователя, возвращает `201` с созданным объектом (включая `id` и `created_at`)
-- [ ] `GET /users/:id` возвращает `200` с пользователем или `404 {"error":"user not found"}`
-- [ ] `GET /users` возвращает `200` со списком всех пользователей (пустой список = `[]`, не `null`)
-- [ ] `PUT /users/:id` обновляет пользователя, возвращает `200` с обновлённым объектом
-- [ ] `DELETE /users/:id` удаляет пользователя, возвращает `204 No Content`
-- [ ] Дублирующий email → `409 {"error":"email already exists"}`
-- [ ] Невалидный JSON → `400 {"error":"invalid request body"}`
-- [ ] Отсутствующее обязательное поле → `400 {"error":"<field> is required"}`
-- [ ] Миграции применяются автоматически при старте приложения
-- [ ] DSN берётся из переменной окружения `DATABASE_URL`, не хардкодится
-- [ ] При `Ctrl+C` — graceful shutdown: сначала `http.Server.Shutdown`, потом `pool.Close()`
-- [ ] `go vet ./...` проходит без предупреждений
-- [ ] Зависимостей только `pgx/v5` и `golang-migrate/migrate/v4`
+- [ ] `List()` переведён на `LIMIT`/`OFFSET` (или keyset-пагинацию по `id`) — **прод-блокер**, без этого пункт про кэш List не имеет смысла
+- [ ] `GetByID` при cache hit не делает ни одного запроса к Postgres — проверяется тестом с мок-репозиторием, считающим вызовы
+- [ ] `GetByID` при cache miss читает из Postgres и прогревает кэш перед возвратом ответа клиенту
+- [ ] N конкурентных `GetByID` с одинаковым `id` при холодном кэше → **ровно один** запрос в Postgres (тест на `singleflight`, `N >= 50` горутин)
+- [ ] `Update`/`Delete` инвалидируют кэш **после** успешного коммита в Postgres, не раньше
+- [ ] Обрыв соединения с Redis не роняет `GetByID` — запрос уходит в Postgres, статус ответа не меняется (тест с недоступным адресом Redis)
+- [ ] Circuit Breaker на Redis-операциях: после N подряд ошибок переходит в `Open`, следующие вызовы **не ждут таймаута Redis**, идут прямиком в Postgres
+- [ ] TTL кэша содержит джиттер ±10% — нет одинакового TTL у двух подряд записанных ключей (тест на разброс значений)
+- [ ] Экспортированы метрики `cache_hits_total`, `cache_misses_total`, `cache_errors_total`, `cache_breaker_state` на `/metrics`
+- [ ] `go vet ./...` и `go test -race ./...` проходят чисто
+- [ ] Ни одной утечки горутин — фоновая запись в кэш ограничена собственным таймаутом, не привязана к отменяемому `request context`
 
 ---
 
@@ -29,45 +27,40 @@
 ### Обязательно
 
 | Требование | Детали |
-|-----------|--------|
-| `pgxpool.New` | пул соединений, не одиночное `pgx.Connect` |
-| `golang-migrate` | `migrations/` директория с `up`/`down` SQL файлами |
-| Repository interface | handlers зависят от интерфейса, не от `*UserRepository` |
-| `pgx.ErrNoRows` → 404 | явная проверка, не generic 500 |
-| unique constraint → 409 | детектить через pgconn.PgError, Code `"23505"` |
-| `defer tx.Rollback(ctx)` | паттерн безопасного отката транзакции |
-| `docker-compose.yml` | PostgreSQL 16, с healthcheck |
-| Config из env | `os.Getenv("DATABASE_URL")`, с валидацией при старте |
+|---|---|
+| `go-redis/v9` | клиент с явными `DialTimeout`/`ReadTimeout`/`WriteTimeout`, пул через `PoolSize`/`MinIdleConns` |
+| `golang.org/x/sync/singleflight` | схлопывание конкурентных промахов по одному ключу в один поход в Postgres |
+| Circuit Breaker (`sony/gobreaker` или самописный) | оборачивает **все** Redis-операции; порог и cooldown задаются конфигом, не хардкодятся |
+| Раздельные `context.WithTimeout` | Redis-таймаут (мс) строго меньше и независим от таймаута Postgres-запроса |
+| Jittered TTL | `ttl ± 10%`, иначе массово прогретые ключи одновременно протухают и бьют по БД разом |
+| Fail-open | ошибка/таймаут Redis — не ошибка запроса, только лог + метрика, деградация на Postgres |
+| Prometheus-метрики | `cache_hits_total`, `cache_misses_total`, `cache_errors_total`, `cache_breaker_state` (0/1/2 = closed/half-open/open) |
+| `LIMIT`/`OFFSET` в `List()` | без этого — Seq Scan на росте таблицы и невозможность нормально кэшировать список |
 
 ### Запрещено
 
-- `panic` для обработки ошибок
-- SQL-строки в handler слое
-- Хардкод DSN или credentials в коде
-- Открывать новое соединение на каждый запрос (`pgx.Connect` вместо pool)
-- Игнорировать ошибку rollback (`_ = tx.Rollback(ctx)` — допустимо, но только если уже есть явный Commit)
+- Кэшировать `List()` без ограничения выборки
+- Блокирующая запись в Redis **на пути ответа** клиенту — `Set` только в фоне с собственным bounded-таймаутом
+- Redis как источник истины — TTL обязателен и конечен, `0`/бессрочные ключи запрещены
+- Молчаливое поглощение ошибок Redis без лога и без инкремента `cache_errors_total`
+- Хардкод адреса Redis, пула, порога Circuit Breaker в коде — всё через `config.Load()`
+- Инвалидация кэша **до** коммита в Postgres (порядок операций фиксирован: сначала БД, потом `DEL`)
 
 ---
 
-## Темы Go, которые ты прокачиваешь
+## Темы, которые ты прокачиваешь
 
-Это не просто список — это checklist того, что обязан использовать в проекте.
+- **Cache-aside pattern** — приложение само решает, когда читать/писать кэш; в отличие от write-through, БД не знает о существовании Redis вообще. Проще в реализации, но окно рассинхрона между БД и кэшем — твоя ответственность.
 
-- **`pgxpool`** — пул соединений к PostgreSQL. `pgxpool.New(ctx, dsn)` возвращает `*pgxpool.Pool`. Pool переиспользует соединения между запросами. Передаётся через dependency injection в repository.
+- **Cache stampede (thundering herd)** — при протухании горячего ключа сотни конкурентных запросов промахиваются одновременно и долбят БД разом. `singleflight` схлопывает их в один поход, остальные ждут результат первого.
 
-- **`pgx.ErrNoRows`** — ошибка которую возвращает pgx когда `QueryRow` не нашёл строк. Нужно явно проверять: `if errors.Is(err, pgx.ErrNoRows)` → возвращать доменную ошибку `ErrNotFound`.
+- **Circuit Breaker (Closed / Open / Half-Open)** — при деградации внешней зависимости важно не ждать таймаут на каждый запрос, а быстро фейлиться после порога ошибок (`Open`), периодически пробуя восстановление (`Half-Open`). Без этого зависший Redis добавляет фиксированную задержку **к каждому** запросу вместо того, чтобы отвалиться разом.
 
-- **`pgconn.PgError`** — структура PostgreSQL-ошибки. Code `"23505"` = unique_violation. Детектить через `var pgErr *pgconn.PgError; errors.As(err, &pgErr)`.
+- **TTL jitter** — если 10 000 ключей прогреты в одну секунду с одинаковым TTL, они протухнут в одну секунду. Джиттер размазывает инвалидацию по времени.
 
-- **Транзакции** — `pool.Begin(ctx)` возвращает `pgx.Tx`. Паттерн: `defer tx.Rollback(ctx)` сразу после Begin, в конце `tx.Commit(ctx)`. Использовать там где несколько операций должны быть атомарными.
+- **Fail-open vs fail-closed** — для read-кэша фейл-открытая деградация (идём в БД) корректна. Для платежей или лимитов был бы нужен fail-closed (отказ безопаснее, чем неверный ответ). Обязан уметь объяснить, почему здесь выбор именно fail-open.
 
-- **`golang-migrate`** — запуск: `migrate.New("file://migrations", dsn)` → `m.Up()`. Вызывать в `main.go` до старта HTTP сервера. `migrate.ErrNoChange` — не ошибка, игнорировать.
-
-- **Repository pattern** — интерфейс `UserRepository` с методами CRUD. `*pgUserRepository` реализует интерфейс. Handler принимает `UserRepository`, не конкретный тип.
-
-- **`context.Context` в SQL** — все pgx-вызовы принимают ctx первым аргументом. Передавать `r.Context()` из HTTP handler через repository в SQL.
-
-- **Sentinel errors** — определить в repository пакете: `var ErrNotFound = errors.New("not found")`. Handler проверяет через `errors.Is`.
+- **Порядок «запись → инвалидация»** — если инвалидировать кэш до коммита в БД и упасть между операциями, старое значение попадёт обратно в кэш при следующем чтении до того, как транзакция вообще завершилась. Порядок фиксированный, не перепутать.
 
 ---
 
@@ -75,17 +68,23 @@
 
 ```
 pg-crud/
-├── main.go                          # wire-up всего приложения
+├── main.go
 ├── config/
-│   └── config.go                    # Config struct + загрузка из env
-├── repository/
-│   └── user.go                      # интерфейс + реализация SQL операций
+│   └── config.go              # + RedisAddr, RedisPoolSize, CacheTTL, BreakerThreshold
 ├── handler/
-│   └── user.go                      # HTTP handlers
+│   ├── user.go                # без изменений
+│   └── user_test.go
+├── repository/
+│   ├── user.go                 # без изменений, List() переведён на LIMIT/OFFSET
+│   ├── redis_client.go         # NEW: конструктор *redis.Client
+│   ├── user_cache.go           # NEW: cachedUserRepository — декоратор UserRepository
+│   └── user_cache_test.go      # NEW: singleflight, fail-open, breaker, jitter
+├── metrics/
+│   └── cache.go                # NEW: Prometheus-коллекторы
 ├── migrations/
-│   ├── 000001_create_users.up.sql   # CREATE TABLE users
-│   └── 000001_create_users.down.sql # DROP TABLE users
-├── docker-compose.yml
+│   ├── 000001_create_users.up.sql
+│   └── 000001_create_users.down.sql
+├── docker-compose.yml          # + redis service
 ├── go.mod
 ├── README.md
 └── task.md
@@ -95,136 +94,128 @@ pg-crud/
 
 ## Разбивка по файлам
 
-### `config/config.go`
+### `repository/user.go` (изменения)
 
-**За что отвечает:** читает переменные окружения, валидирует их, возвращает типизированный Config.
+**За что отвечает:** persistence-слой, как раньше, плюс пагинация.
 
-**Типы и структуры:**
-- `Config` — хранит все настройки приложения: DatabaseURL, ServerAddr, PoolMaxConns
+**Изменения:**
+- `List(ctx context.Context, limit, offset int) ([]*User, error)` — сигнатура меняется, `ORDER BY id LIMIT $1 OFFSET $2`
+- Интерфейс `UserRepository.List` обновляется синхронно, `handler/user.go` парсит `?limit=&offset=` из query-параметров с дефолтами и верхним потолком (`limit > 100` → `400`)
 
-**Функции:**
-- `func Load() (*Config, error)` — читает `DATABASE_URL` и опциональные параметры из env; если `DATABASE_URL` пустой — возвращает ошибку; возвращает заполненный `*Config`
-
-**Связи:** `main.go → config/config.go`
+**Связи:** `cachedUserRepository.List` проксирует напрямую, без кэша
 
 ---
 
-### `repository/user.go`
+### `repository/redis_client.go`
 
-**За что отвечает:** весь SQL для таблицы users — единственное место где есть pgx-вызовы.
-
-**Типы и структуры:**
-- `User` — доменная структура: `ID int64`, `Name string`, `Email string`, `CreatedAt time.Time`
-- `UserRepository` — интерфейс с методами CRUD; handler зависит от него, не от конкретного типа
-- `pgUserRepository` — приватная структура, реализует `UserRepository`, хранит `*pgxpool.Pool`
-- `var ErrNotFound = errors.New("user not found")` — sentinel error для 404
+**За что отвечает:** конструктор клиента с явными таймаутами, чтобы зависший Redis не подвешивал горутины хендлеров.
 
 **Функции:**
-- `func NewUserRepository(pool *pgxpool.Pool) UserRepository` — конструктор; принимает пул, возвращает интерфейс
-- `func (r *pgUserRepository) Create(ctx context.Context, name, email string) (*User, error)` — INSERT с RETURNING id, created_at; при unique violation возвращает `ErrDuplicateEmail`
-- `func (r *pgUserRepository) GetByID(ctx context.Context, id int64) (*User, error)` — SELECT по id; при `pgx.ErrNoRows` возвращает `ErrNotFound`
-- `func (r *pgUserRepository) List(ctx context.Context) ([]*User, error)` — SELECT всех; при пустой таблице возвращает пустой slice (не nil)
-- `func (r *pgUserRepository) Update(ctx context.Context, id int64, name, email string) (*User, error)` — UPDATE с RETURNING; при `pgx.ErrNoRows` возвращает `ErrNotFound`
-- `func (r *pgUserRepository) Delete(ctx context.Context, id int64) error` — DELETE; проверяет `RowsAffected() == 0` → возвращает `ErrNotFound`
+- `func NewRedisClient(ctx context.Context, cfg RedisConfig) (*redis.Client, error)` — `redis.NewClient` с `DialTimeout=2s`, `ReadTimeout=500ms`, `WriteTimeout=500ms`, `PoolSize`/`MinIdleConns` из конфига, `Ping` при старте с отдельным таймаутом
 
-**Связи:** `handler/user.go → repository/user.go (через интерфейс)`; `main.go → repository/user.go (конструктор)`
+**Связи:** `main.go → repository.NewRedisClient(ctx, cfg)`
 
 ---
 
-### `handler/user.go`
+### `repository/user_cache.go`
 
-**За что отвечает:** HTTP — декодирование запроса, вызов repository, кодирование ответа, маппинг доменных ошибок в HTTP статусы.
+**За что отвечает:** cache-aside декоратор над `UserRepository`, единственное место, знающее о Redis.
 
-**Типы и структуры:**
-- `UserHandler` — хранит `repo repository.UserRepository`
-- `createUserRequest` — JSON тело для POST: `Name string`, `Email string`
-- `updateUserRequest` — JSON тело для PUT: `Name string`, `Email string`
+**Типы:**
+- `type cachedUserRepository struct { next UserRepository; redis *redis.Client; breaker *gobreaker.CircuitBreaker; ttl time.Duration; sf singleflight.Group; metrics *metrics.CacheMetrics }`
 
 **Функции:**
-- `func NewUserHandler(repo repository.UserRepository) *UserHandler` — конструктор
-- `func (h *UserHandler) Create(w http.ResponseWriter, r *http.Request)` — декодирует тело, вызывает `repo.Create`, при `ErrDuplicateEmail` → 409, при успехе → 201 + JSON
-- `func (h *UserHandler) GetByID(w http.ResponseWriter, r *http.Request)` — берёт id из `r.PathValue("id")`, парсит в int64, вызывает `repo.GetByID`; при `ErrNotFound` → 404
-- `func (h *UserHandler) List(w http.ResponseWriter, r *http.Request)` — вызывает `repo.List`, пишет JSON; nil slice кодирует как `[]`
-- `func (h *UserHandler) Update(w http.ResponseWriter, r *http.Request)` — декодирует тело, берёт id из path, вызывает `repo.Update`
-- `func (h *UserHandler) Delete(w http.ResponseWriter, r *http.Request)` — берёт id, вызывает `repo.Delete`, при успехе → 204 без тела
-- `func writeJSON(w http.ResponseWriter, status int, v any)` — хелпер: устанавливает Content-Type, пишет статус, кодирует v в JSON
-- `func writeError(w http.ResponseWriter, status int, msg string)` — хелпер: пишет `{"error":"msg"}` с нужным статусом
+- `func NewCachedUserRepository(next UserRepository, rdb *redis.Client, ttl time.Duration, m *metrics.CacheMetrics) UserRepository`
+- `func (r *cachedUserRepository) GetByID(ctx context.Context, id int64) (*User, error)` — Redis GET через breaker → hit/miss/error по метрикам → `sf.Do` на miss → фоновый `Set` с джиттером
+- `func (r *cachedUserRepository) Create/Update/Delete(...)` — проксируют в `next`, `Update`/`Delete` вызывают `invalidate` после успешного ответа `next`
+- `func (r *cachedUserRepository) invalidate(ctx context.Context, id int64)` — `DEL` через breaker, ошибка только логируется
+- `func (r *cachedUserRepository) jitteredTTL() time.Duration` — `ttl ± 10%` через `math/rand`
 
-**Связи:** `main.go → handler/user.go`; `handler/user.go → repository (интерфейс)`
+**Связи:** `main.go` оборачивает `pgUserRepository` этим декоратором перед передачей в `handler.NewUserHandler`
 
 ---
 
-### `main.go`
+### `metrics/cache.go`
 
-**За что отвечает:** инициализация всех зависимостей в правильном порядке и graceful shutdown.
+**За что отвечает:** Prometheus-коллекторы для кэш-слоя, регистрируются один раз при старте.
+
+**Типы:**
+- `type CacheMetrics struct { Hits, Misses, Errors prometheus.Counter; BreakerState prometheus.Gauge }`
 
 **Функции:**
-- `func main()` — последовательно: `config.Load()` → `pgxpool.New()` → запуск миграций → `repository.NewUserRepository()` → `handler.NewUserHandler()` → регистрация маршрутов → `signal.NotifyContext` → `srv.ListenAndServe()` в горутине → ожидание сигнала → `srv.Shutdown()` → `pool.Close()`
+- `func NewCacheMetrics(reg prometheus.Registerer) *CacheMetrics` — регистрирует все коллекторы, паникует при дублирующей регистрации (fail-fast на старте, не в рантайме)
 
-**Связи:** импортирует все пакеты проекта; точка входа
+**Связи:** передаётся в `repository.NewCachedUserRepository`, обновляется на каждый hit/miss/error и на смену состояния breaker
 
 ---
 
-### `migrations/000001_create_users.up.sql`
+### `main.go` (изменения)
 
-```sql
-CREATE TABLE IF NOT EXISTS users (
-    id         BIGSERIAL PRIMARY KEY,
-    name       TEXT NOT NULL,
-    email      TEXT NOT NULL UNIQUE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-```
+**Функции:**
+- `func main()` — после `pgxpool.NewWithConfig`: `repository.NewRedisClient` → `metrics.NewCacheMetrics` → `gobreaker.NewCircuitBreaker` с порогом из конфига → `repository.NewCachedUserRepository(pgRepo, redisClient, cfg.CacheTTL, cacheMetrics)` → `handler.NewUserHandler(cachedRepo)` → добавить `mux.Handle("/metrics", promhttp.Handler())`
 
-### `migrations/000001_create_users.down.sql`
-
-```sql
-DROP TABLE IF EXISTS users;
-```
+**Связи:** точка сборки всех зависимостей, порядок инициализации фиксирован — Redis поднимается после Postgres, до создания хендлеров
 
 ---
 
 ## Подсказки по архитектуре
 
-**Детектирование unique constraint violation:**
+**Circuit Breaker вокруг Redis-вызова:**
 ```go
-var pgErr *pgconn.PgError
-if errors.As(err, &pgErr) && pgErr.Code == "23505" {
-    return ErrDuplicateEmail
+func (r *cachedUserRepository) getFromCache(ctx context.Context, key string) ([]byte, error) {
+    v, err := r.breaker.Execute(func() (interface{}, error) {
+        cacheCtx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
+        defer cancel()
+        return r.redis.Get(cacheCtx, key).Bytes()
+    })
+    if err != nil {
+        return nil, err // сюда прилетает и redis.Nil, и gobreaker.ErrOpenState — разбирать в вызывающем коде
+    }
+    return v.([]byte), nil
+}
+```
+`gobreaker.ErrOpenState` — отдельная ветка от `redis.Nil`: **Open** значит "даже не пытались стучаться", это не промах кэша, это отказ от похода в Redis вообще.
+
+**Инвалидация строго после коммита:**
+```go
+func (r *cachedUserRepository) Update(ctx context.Context, id int64, name, email string) (*User, error) {
+    u, err := r.next.Update(ctx, id, name, email) // сначала источник истины
+    if err != nil {
+        return nil, err
+    }
+    r.invalidate(ctx, id) // потом кэш; если invalidate упадёт — залогируется, TTL сам почистит
+    return u, nil
 }
 ```
 
-**Пустой список вместо null в JSON:**
+**Фоновая запись без утечки горутин:**
 ```go
-users := make([]*User, 0) // не var users []*User
-```
-
-**Порядок shutdown в main.go важен:**
-```
-srv.Shutdown(ctx) → pool.Close()
-```
-Сначала HTTP, потом закрываем пул — иначе in-flight запросы получат ошибку соединения.
-
-**Запуск миграций:**
-```go
-m, err := migrate.New("file://migrations", cfg.DatabaseURL)
-if err != nil { log.Fatal(err) }
-if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
-    log.Fatal(err)
+func (r *cachedUserRepository) setAsync(u *User) {
+    go func() {
+        ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+        defer cancel()
+        // ctx не привязан к отменяемому request context — иначе отмена
+        // клиентом запроса оборвёт прогрев кэша на середине
+        payload, _ := json.Marshal(u)
+        _, _ = r.breaker.Execute(func() (interface{}, error) {
+            return nil, r.redis.Set(ctx, userCacheKey(u.ID), payload, r.jitteredTTL()).Err()
+        })
+    }()
 }
 ```
+Горутина не утечёт: у неё собственный ограниченный по времени контекст (300 мс максимум), она не может зависнуть навечно.
 
 ---
 
 ## Definition of Done
 
-1. Все Acceptance Criteria проверены curl-командами из раздела выше
-2. Код загружен на GitHub в репозиторий `pg-crud`
-3. README.md в репозитории
-4. Можешь объяснить: зачем pool вместо одного соединения, как работает `defer tx.Rollback`, почему `errors.Is(err, pgx.ErrNoRows)` а не сравнение строк, что такое Code `"23505"`
+1. Все Acceptance Criteria закрыты тестами, `go test -race ./...` зелёный
+2. Нагрузочный прогон (`hey`/`wrk`, N=1000 конкурентных запросов на один и тот же `id` с холодным кэшем) показывает **один** запрос в Postgres в логах — доказывает работу `singleflight`
+3. Искусственно уронить Redis (`docker stop redis`) во время нагрузки — сервис продолжает отвечать `200`, `cache_errors_total` растёт, breaker переходит в `Open`, задержка ответа не деградирует до таймаута Redis на каждый запрос
+4. Можешь объяснить: почему инвалидация идёт после коммита, а не до; чем `singleflight` отличается от простого мьютекса на ключ; почему `Open` state брейкера — это не то же самое, что `redis.Nil`; зачем джиттер на TTL, если можно просто уменьшить TTL
 
 ---
 
 ## Следующий шаг после сдачи
 
-Task #8 — gRPC Service: protobuf, grpc-go, unary + server-streaming, interceptors.
+Task #10 — Rate Limiting на уровне `handler` (token bucket поверх `net/http`, по IP или по API-ключу). Кэш защищает от повторных чтений существующих `id`, но не от потока запросов на **несуществующие** `id` — они всегда промахиваются мимо кэша и бьют напрямую в Postgres, кэш тут бессилен в принципе.
