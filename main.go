@@ -89,7 +89,12 @@ func runMigrations(dsn string) error {
 	if err != nil {
 		return err
 	}
-	defer m.Close()
+	defer func() {
+		srcErr, dbErr := m.Close()
+		if srcErr != nil || dbErr != nil {
+			log.Printf("migrate close: source=%v db=%v", srcErr, dbErr)
+		}
+	}()
 
 	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
 		return err
