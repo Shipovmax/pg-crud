@@ -83,8 +83,37 @@ func (h *UserHandler) GetByID(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, u)
 }
 
+const (
+	defaultListLimit = 20
+	maxListLimit     = 100
+)
+
 func (h *UserHandler) List(w http.ResponseWriter, r *http.Request) {
-	users, err := h.repo.List(r.Context())
+	limit := defaultListLimit
+	if v := r.URL.Query().Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			writeError(w, http.StatusBadRequest, "limit must be a positive integer")
+			return
+		}
+		if n > maxListLimit {
+			writeError(w, http.StatusBadRequest, "limit must not exceed 100")
+			return
+		}
+		limit = n
+	}
+
+	offset := 0
+	if v := r.URL.Query().Get("offset"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			writeError(w, http.StatusBadRequest, "offset must be a non-negative integer")
+			return
+		}
+		offset = n
+	}
+
+	users, err := h.repo.List(r.Context(), limit, offset)
 	if err != nil {
 		log.Printf("list users: %v", err)
 		writeError(w, http.StatusServiceUnavailable, "service unavailable")

@@ -32,7 +32,7 @@ const queryTimeout = 5 * time.Second
 type UserRepository interface {
 	Create(ctx context.Context, name, email string) (*User, error)
 	GetByID(ctx context.Context, id int64) (*User, error)
-	List(ctx context.Context) ([]*User, error)
+	List(ctx context.Context, limit, offset int) ([]*User, error)
 	Update(ctx context.Context, id int64, name, email string) (*User, error)
 	Delete(ctx context.Context, id int64) error
 }
@@ -81,13 +81,13 @@ func (r *pgUserRepository) GetByID(ctx context.Context, id int64) (*User, error)
 	return u, nil
 }
 
-func (r *pgUserRepository) List(ctx context.Context) ([]*User, error) {
-	const q = `SELECT id, name, email, created_at FROM users ORDER BY id`
+func (r *pgUserRepository) List(ctx context.Context, limit, offset int) ([]*User, error) {
+	const q = `SELECT id, name, email, created_at FROM users ORDER BY id LIMIT $1 OFFSET $2`
 
 	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
 	defer cancel()
 
-	rows, err := r.pool.Query(ctx, q)
+	rows, err := r.pool.Query(ctx, q, limit, offset)
 	if err != nil {
 		return nil, err
 	}

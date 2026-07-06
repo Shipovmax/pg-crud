@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
 	"testing"
 	"time"
@@ -42,10 +43,16 @@ func (f *fakeUserRepository) GetByID(_ context.Context, id int64) (*repository.U
 	return u, nil
 }
 
-func (f *fakeUserRepository) List(_ context.Context) ([]*repository.User, error) {
-	users := make([]*repository.User, 0, len(f.users))
-	for _, u := range f.users {
-		users = append(users, u)
+func (f *fakeUserRepository) List(_ context.Context, limit, offset int) ([]*repository.User, error) {
+	ids := make([]int64, 0, len(f.users))
+	for id := range f.users {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+
+	users := make([]*repository.User, 0, limit)
+	for i := offset; i < len(ids) && len(users) < limit; i++ {
+		users = append(users, f.users[ids[i]])
 	}
 	return users, nil
 }
@@ -172,6 +179,35 @@ func TestDelete(t *testing.T) {
 	rec = doRequest(h.Delete, http.MethodDelete, "/users/"+itoa(u.ID), nil, itoa(u.ID))
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("got status %d, want %d", rec.Code, http.StatusNotFound)
+	}
+}
+
+func TestList(t *testing.T) {
+	h, repo := newTestHandler()
+	for i := range 3 {
+		repo.Create(context.Background(), "User"+itoa(int64(i)), "user"+itoa(int64(i))+"@example.com")
+	}
+
+	rec := doRequest(h.List, http.MethodGet, "/users?limit=2&offset=1", nil, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got status %d, want %d, body: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var got []*repository.User
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d users, want 2", len(got))
+	}
+
+	rec = doRequest(h.List, http.MethodGet, "/users?limit=101", nil, "")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("got status %d, want %d", rec.Code, http.StatusBadRequest)
+	}
+
+	rec = doRequest(h.List, http.MethodGet, "/users?limit=abc", nil, "")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("got status %d, want %d", rec.Code, http.StatusBadRequest)
 	}
 }
 

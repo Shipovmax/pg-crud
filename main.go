@@ -13,9 +13,12 @@ import (
 	_ "github.com/golang-migrate/migrate/v4/database/postgres"
 	_ "github.com/golang-migrate/migrate/v4/source/file"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"pg-crud/config"
 	"pg-crud/handler"
+	"pg-crud/metrics"
 	"pg-crud/repository"
 )
 
@@ -44,8 +47,25 @@ func main() {
 		log.Fatalf("migrations: %v", err)
 	}
 
-	repo := repository.NewUserRepository(pool)
-	userHandler := handler.NewUserHandler(repo)
+	redisClient, err := repository.NewRedisClient(ctx, repository.RedisConfig{
+		Addr:         cfg.RedisAddr,
+		PoolSize:     cfg.RedisPoolSize,
+		MinIdleConns: cfg.RedisMinIdleConns,
+	})
+	if err != nil {
+		log.Fatalf("redis: %v", err)
+	}
+	defer redisClient.Close()
+
+	cacheMetrics := metrics.NewCacheMetrics(prometheus.DefaultRegisterer)
+
+	pgRepo := repository.NewUserRepository(pool)
+	cachedRepo := repository.NewCachedUserRepository(pgRepo, redisClient, cfg.CacheTTL, repository.BreakerConfig{
+		Threshold: cfg.BreakerThreshold,
+		Cooldown:  cfg.BreakerCooldown,
+	}, cacheMetrics)
+
+	userHandler := handler.NewUserHandler(cachedRepo)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /users", userHandler.Create)
@@ -53,6 +73,7 @@ func main() {
 	mux.HandleFunc("GET /users/{id}", userHandler.GetByID)
 	mux.HandleFunc("PUT /users/{id}", userHandler.Update)
 	mux.HandleFunc("DELETE /users/{id}", userHandler.Delete)
+	mux.Handle("/metrics", promhttp.Handler())
 
 	srv := &http.Server{
 		Addr:              cfg.ServerAddr,
