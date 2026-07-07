@@ -3,11 +3,12 @@ package handler
 import (
 	"encoding/json"
 	"errors"
-	"log"
+	"log/slog"
 	"net/http"
 	"regexp"
 	"strconv"
 
+	"pg-crud/logging"
 	"pg-crud/repository"
 )
 
@@ -28,9 +29,12 @@ type createUserRequest struct {
 	Email string `json:"email"`
 }
 
+// updateUserRequest carries the optimistic-lock version the client read;
+// a stale version is rejected with 409 instead of silently overwriting.
 type updateUserRequest struct {
-	Name  string `json:"name"`
-	Email string `json:"email"`
+	Name    string `json:"name"`
+	Email   string `json:"email"`
+	Version int64  `json:"version"`
 }
 
 func (h *UserHandler) Create(w http.ResponseWriter, r *http.Request) {
@@ -54,7 +58,7 @@ func (h *UserHandler) Create(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusConflict, "email already exists")
 			return
 		}
-		log.Printf("create user: %v", err)
+		logging.FromContext(r.Context()).Error("create user", "error", err)
 		writeError(w, http.StatusServiceUnavailable, "service unavailable")
 		return
 	}
@@ -75,7 +79,7 @@ func (h *UserHandler) GetByID(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "user not found")
 			return
 		}
-		log.Printf("get user: %v", err)
+		logging.FromContext(r.Context()).Error("get user", "error", err)
 		writeError(w, http.StatusServiceUnavailable, "service unavailable")
 		return
 	}
@@ -115,7 +119,7 @@ func (h *UserHandler) List(w http.ResponseWriter, r *http.Request) {
 
 	users, err := h.repo.List(r.Context(), limit, offset)
 	if err != nil {
-		log.Printf("list users: %v", err)
+		logging.FromContext(r.Context()).Error("list users", "error", err)
 		writeError(w, http.StatusServiceUnavailable, "service unavailable")
 		return
 	}
@@ -143,8 +147,12 @@ func (h *UserHandler) Update(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "email is invalid")
 		return
 	}
+	if req.Version < 1 {
+		writeError(w, http.StatusBadRequest, "version is required")
+		return
+	}
 
-	u, err := h.repo.Update(r.Context(), id, req.Name, req.Email)
+	u, err := h.repo.Update(r.Context(), id, req.Name, req.Email, req.Version)
 	if err != nil {
 		if errors.Is(err, repository.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "user not found")
@@ -154,7 +162,11 @@ func (h *UserHandler) Update(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusConflict, "email already exists")
 			return
 		}
-		log.Printf("update user: %v", err)
+		if errors.Is(err, repository.ErrVersionConflict) {
+			writeError(w, http.StatusConflict, "version conflict")
+			return
+		}
+		logging.FromContext(r.Context()).Error("update user", "error", err)
 		writeError(w, http.StatusServiceUnavailable, "service unavailable")
 		return
 	}
@@ -174,7 +186,7 @@ func (h *UserHandler) Delete(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "user not found")
 			return
 		}
-		log.Printf("delete user: %v", err)
+		logging.FromContext(r.Context()).Error("delete user", "error", err)
 		writeError(w, http.StatusServiceUnavailable, "service unavailable")
 		return
 	}
@@ -186,7 +198,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(v); err != nil {
-		log.Printf("write json response: %v", err)
+		slog.Default().Error("write json response", "error", err)
 	}
 }
 

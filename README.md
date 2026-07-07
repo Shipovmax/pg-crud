@@ -26,9 +26,9 @@ This is exactly the type of project where most junior developers make critical m
 
 ### Stack
 
-- Language: Go 1.23
-- Dependencies: `pgx/v5`, `golang-migrate/migrate/v4`
-- Infrastructure: PostgreSQL 16, Docker (for local database instance)
+- Language: Go 1.25
+- Dependencies: `pgx/v5`, `golang-migrate/migrate/v4`, `redis/go-redis/v9`, `sony/gobreaker`, `golang.org/x/sync/singleflight`, `prometheus/client_golang`
+- Infrastructure: PostgreSQL 16, Redis 7, Docker
 - Platform: Linux/macOS
 
 ---
@@ -84,7 +84,7 @@ pg-crud/
 ### Setup and run
 
 ```bash
-# Spin up PostgreSQL instance
+# Spin up PostgreSQL + Redis
 docker compose up -d
 
 # Spin up the service
@@ -92,6 +92,10 @@ DATABASE_URL="postgres://postgres:postgres@localhost:5432/pgcrud?sslmode=disable
 go run ./...
 
 ```
+
+Optional environment variables (defaults in parentheses): `SERVER_ADDR` (`:8080`), `POOL_MAX_CONNS` (`10`), `REDIS_ADDR` (`localhost:6379`), `REDIS_POOL_SIZE` (`10`), `REDIS_MIN_IDLE_CONNS` (`2`), `CACHE_TTL_SECONDS` (`60`), `BREAKER_THRESHOLD` (`5`), `BREAKER_COOLDOWN_SECONDS` (`30`).
+
+Operational endpoints: `/metrics` (Prometheus), `/healthz` (liveness), `/readyz` (readiness — requires Postgres; a degraded Redis is reported but does not fail readiness, since the cache layer fails open).
 
 ### Usage
 
@@ -104,13 +108,14 @@ curl -X POST http://localhost:8080/users \
 # Get a user by ID
 curl http://localhost:8080/users/1
 
-# List all users
-curl http://localhost:8080/users
+# List users (paginated, limit <= 100)
+curl "http://localhost:8080/users?limit=20&offset=0"
 
-# Update a user
+# Update a user — version implements optimistic locking: send the version
+# you read; a stale version yields 409 instead of a silent lost update
 curl -X PUT http://localhost:8080/users/1 \
   -H "Content-Type: application/json" \
-  -d '{"name":"Alice Updated","email":"alice@example.com"}'
+  -d '{"name":"Alice Updated","email":"alice@example.com","version":1}'
 
 # Delete a user
 curl -X DELETE http://localhost:8080/users/1
@@ -151,6 +156,9 @@ POST /users (malformed body) → 400 {"error":"invalid request body"}
 
 # Missing required validation fields
 POST /users (empty email) → 400 {"error":"email is required"}
+
+# Stale optimistic-lock version (concurrent update won)
+PUT /users/1 (old version) → 409 {"error":"version conflict"}
 
 # Database connectivity failure
 any request → 503 {"error":"service unavailable"}

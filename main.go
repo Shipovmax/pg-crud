@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
-	"log"
+	"log/slog"
 	"net/http"
+	"os"
 	"os/signal"
 	"syscall"
 	"time"
@@ -19,32 +21,42 @@ import (
 	"pg-crud/config"
 	"pg-crud/handler"
 	"pg-crud/metrics"
+	"pg-crud/middleware"
 	"pg-crud/repository"
 )
 
+// fatal logs the startup error and exits: these run before the server
+// accepts traffic, so there is nothing to shut down gracefully yet.
+func fatal(msg string, err error) {
+	slog.Error(msg, "error", err)
+	os.Exit(1)
+}
+
 func main() {
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+
 	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("config: %v", err)
+		fatal("config", err)
 	}
 
 	ctx := context.Background()
 
 	poolCfg, err := pgxpool.ParseConfig(cfg.DatabaseURL)
 	if err != nil {
-		log.Fatalf("parse pool config: %v", err)
+		fatal("parse pool config", err)
 	}
 	poolCfg.MaxConns = cfg.PoolMaxConns
 	poolCfg.MinConns = 1
 
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
-		log.Fatalf("create pool: %v", err)
+		fatal("create pool", err)
 	}
 	defer pool.Close()
 
 	if err := runMigrations(cfg.DatabaseURL); err != nil {
-		log.Fatalf("migrations: %v", err)
+		fatal("migrations", err)
 	}
 
 	redisClient, err := repository.NewRedisClient(ctx, repository.RedisConfig{
@@ -53,11 +65,12 @@ func main() {
 		MinIdleConns: cfg.RedisMinIdleConns,
 	})
 	if err != nil {
-		log.Fatalf("redis: %v", err)
+		fatal("redis", err)
 	}
 	defer redisClient.Close()
 
 	cacheMetrics := metrics.NewCacheMetrics(prometheus.DefaultRegisterer)
+	httpMetrics := metrics.NewHTTPMetrics(prometheus.DefaultRegisterer)
 
 	pgRepo := repository.NewUserRepository(pool)
 	cachedRepo := repository.NewCachedUserRepository(pgRepo, redisClient, cfg.CacheTTL, repository.BreakerConfig{
@@ -75,9 +88,33 @@ func main() {
 	mux.HandleFunc("DELETE /users/{id}", userHandler.Delete)
 	mux.Handle("/metrics", promhttp.Handler())
 
+	// Liveness: the process is up and serving. No dependency checks —
+	// restarting the pod won't fix a broken Postgres.
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		writeHealth(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
+
+	// Readiness: Postgres is mandatory (source of truth), Redis is not —
+	// the cache layer fails open, so a degraded cache must not pull the
+	// instance out of the load balancer.
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
+		checkCtx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+
+		if err := pool.Ping(checkCtx); err != nil {
+			writeHealth(w, http.StatusServiceUnavailable, map[string]string{"status": "unavailable", "postgres": "down"})
+			return
+		}
+		cache := "ok"
+		if err := redisClient.Ping(checkCtx).Err(); err != nil {
+			cache = "degraded"
+		}
+		writeHealth(w, http.StatusOK, map[string]string{"status": "ok", "postgres": "ok", "cache": cache})
+	})
+
 	srv := &http.Server{
 		Addr:              cfg.ServerAddr,
-		Handler:           mux,
+		Handler:           middleware.Instrument(mux, httpMetrics),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
@@ -88,20 +125,28 @@ func main() {
 	defer stop()
 
 	go func() {
-		log.Printf("listening on %s", cfg.ServerAddr)
+		slog.Info("listening", "addr", cfg.ServerAddr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("listen: %v", err)
+			fatal("listen", err)
 		}
 	}()
 
 	<-sigCtx.Done()
-	log.Println("shutting down")
+	slog.Info("shutting down")
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Printf("server shutdown: %v", err)
+		slog.Error("server shutdown", "error", err)
+	}
+}
+
+func writeHealth(w http.ResponseWriter, status int, body map[string]string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(body); err != nil {
+		slog.Error("write health response", "error", err)
 	}
 }
 
@@ -113,7 +158,7 @@ func runMigrations(dsn string) error {
 	defer func() {
 		srcErr, dbErr := m.Close()
 		if srcErr != nil || dbErr != nil {
-			log.Printf("migrate close: source=%v db=%v", srcErr, dbErr)
+			slog.Warn("migrate close", "source_error", srcErr, "db_error", dbErr)
 		}
 	}()
 

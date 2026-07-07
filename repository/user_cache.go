@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"log"
+	"log/slog"
 	"math/rand/v2"
 	"strconv"
 	"time"
@@ -13,6 +13,7 @@ import (
 	"github.com/sony/gobreaker"
 	"golang.org/x/sync/singleflight"
 
+	"pg-crud/logging"
 	"pg-crud/metrics"
 )
 
@@ -56,7 +57,8 @@ func NewCachedUserRepository(next UserRepository, rdb *redis.Client, ttl time.Du
 			return counts.ConsecutiveFailures >= breakerCfg.Threshold
 		},
 		OnStateChange: func(name string, from, to gobreaker.State) {
-			log.Printf("%s circuit breaker: %s -> %s", name, from, to)
+			slog.Default().Warn("circuit breaker state change",
+				"breaker", name, "from", from.String(), "to", to.String())
 			m.BreakerState.Set(float64(to))
 		},
 	})
@@ -86,7 +88,7 @@ func (r *cachedUserRepository) GetByID(ctx context.Context, id int64) (*User, er
 			r.metrics.Hits.Inc()
 			return &u, nil
 		}
-		log.Printf("cache unmarshal user %d: %v", id, unmarshalErr)
+		logging.FromContext(ctx).Warn("cache unmarshal failed", "user_id", id, "error", unmarshalErr)
 		r.metrics.Errors.Inc()
 	case errors.Is(err, redis.Nil):
 		r.metrics.Misses.Inc()
@@ -94,7 +96,7 @@ func (r *cachedUserRepository) GetByID(ctx context.Context, id int64) (*User, er
 		// Covers gobreaker.ErrOpenState/ErrTooManyRequests and any
 		// transport/timeout error alike: the cache path failed, fall
 		// through to Postgres (fail-open).
-		log.Printf("cache get user %d: %v", id, err)
+		logging.FromContext(ctx).Warn("cache get failed", "user_id", id, "error", err)
 		r.metrics.Errors.Inc()
 	}
 
@@ -116,8 +118,8 @@ func (r *cachedUserRepository) List(ctx context.Context, limit, offset int) ([]*
 	return r.next.List(ctx, limit, offset)
 }
 
-func (r *cachedUserRepository) Update(ctx context.Context, id int64, name, email string) (*User, error) {
-	u, err := r.next.Update(ctx, id, name, email) // source of truth first
+func (r *cachedUserRepository) Update(ctx context.Context, id int64, name, email string, version int64) (*User, error) {
+	u, err := r.next.Update(ctx, id, name, email, version) // source of truth first
 	if err != nil {
 		return nil, err
 	}
@@ -160,7 +162,7 @@ func (r *cachedUserRepository) invalidate(ctx context.Context, id int64) {
 		return nil, r.redis.Del(cacheCtx, userCacheKey(id)).Err()
 	})
 	if err != nil {
-		log.Printf("cache invalidate user %d: %v", id, err)
+		logging.FromContext(ctx).Warn("cache invalidate failed", "user_id", id, "error", err)
 		r.metrics.Errors.Inc()
 	}
 }
@@ -173,7 +175,7 @@ func (r *cachedUserRepository) invalidate(ctx context.Context, id int64) {
 func (r *cachedUserRepository) setAsync(u *User) {
 	payload, err := json.Marshal(u)
 	if err != nil {
-		log.Printf("cache marshal user %d: %v", u.ID, err)
+		slog.Default().Error("cache marshal failed", "user_id", u.ID, "error", err)
 		r.metrics.Errors.Inc()
 		return
 	}
@@ -186,7 +188,8 @@ func (r *cachedUserRepository) setAsync(u *User) {
 			return nil, r.redis.Set(ctx, userCacheKey(u.ID), payload, r.jitteredTTL()).Err()
 		})
 		if err != nil {
-			log.Printf("cache set user %d: %v", u.ID, err)
+			// Detached from the request, so no trace_id here by design.
+			slog.Default().Warn("cache set failed", "user_id", u.ID, "error", err)
 			r.metrics.Errors.Inc()
 		}
 	}()

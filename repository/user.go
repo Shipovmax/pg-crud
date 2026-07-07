@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -15,12 +16,16 @@ type User struct {
 	ID        int64     `json:"id"`
 	Name      string    `json:"name"`
 	Email     string    `json:"email"`
+	Version   int64     `json:"version"`
 	CreatedAt time.Time `json:"created_at"`
 }
 
 var (
 	ErrNotFound       = errors.New("user not found")
 	ErrDuplicateEmail = errors.New("email already exists")
+	// ErrVersionConflict signals that Update was called with a stale
+	// version: another writer committed since the caller read the row.
+	ErrVersionConflict = errors.New("user version conflict")
 )
 
 // queryTimeout bounds each database round-trip independently of the
@@ -33,7 +38,10 @@ type UserRepository interface {
 	Create(ctx context.Context, name, email string) (*User, error)
 	GetByID(ctx context.Context, id int64) (*User, error)
 	List(ctx context.Context, limit, offset int) ([]*User, error)
-	Update(ctx context.Context, id int64, name, email string) (*User, error)
+	// Update applies optimistic concurrency control: the write succeeds
+	// only if the stored version matches the one the caller read.
+	// A stale version yields ErrVersionConflict.
+	Update(ctx context.Context, id int64, name, email string, version int64) (*User, error)
 	Delete(ctx context.Context, id int64) error
 }
 
@@ -47,13 +55,13 @@ func NewUserRepository(pool *pgxpool.Pool) UserRepository {
 }
 
 func (r *pgUserRepository) Create(ctx context.Context, name, email string) (*User, error) {
-	const q = `INSERT INTO users (name, email) VALUES ($1, $2) RETURNING id, name, email, created_at`
+	const q = `INSERT INTO users (name, email) VALUES ($1, $2) RETURNING id, name, email, version, created_at`
 
 	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
 	defer cancel()
 
 	u := &User{}
-	err := r.pool.QueryRow(ctx, q, name, email).Scan(&u.ID, &u.Name, &u.Email, &u.CreatedAt)
+	err := r.pool.QueryRow(ctx, q, name, email).Scan(&u.ID, &u.Name, &u.Email, &u.Version, &u.CreatedAt)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
@@ -65,13 +73,13 @@ func (r *pgUserRepository) Create(ctx context.Context, name, email string) (*Use
 }
 
 func (r *pgUserRepository) GetByID(ctx context.Context, id int64) (*User, error) {
-	const q = `SELECT id, name, email, created_at FROM users WHERE id = $1`
+	const q = `SELECT id, name, email, version, created_at FROM users WHERE id = $1`
 
 	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
 	defer cancel()
 
 	u := &User{}
-	err := r.pool.QueryRow(ctx, q, id).Scan(&u.ID, &u.Name, &u.Email, &u.CreatedAt)
+	err := r.pool.QueryRow(ctx, q, id).Scan(&u.ID, &u.Name, &u.Email, &u.Version, &u.CreatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
@@ -82,7 +90,7 @@ func (r *pgUserRepository) GetByID(ctx context.Context, id int64) (*User, error)
 }
 
 func (r *pgUserRepository) List(ctx context.Context, limit, offset int) ([]*User, error) {
-	const q = `SELECT id, name, email, created_at FROM users ORDER BY id LIMIT $1 OFFSET $2`
+	const q = `SELECT id, name, email, version, created_at FROM users ORDER BY id LIMIT $1 OFFSET $2`
 
 	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
 	defer cancel()
@@ -96,7 +104,7 @@ func (r *pgUserRepository) List(ctx context.Context, limit, offset int) ([]*User
 	users := make([]*User, 0)
 	for rows.Next() {
 		u := &User{}
-		if err := rows.Scan(&u.ID, &u.Name, &u.Email, &u.CreatedAt); err != nil {
+		if err := rows.Scan(&u.ID, &u.Name, &u.Email, &u.Version, &u.CreatedAt); err != nil {
 			return nil, err
 		}
 		users = append(users, u)
@@ -107,16 +115,30 @@ func (r *pgUserRepository) List(ctx context.Context, limit, offset int) ([]*User
 	return users, nil
 }
 
-func (r *pgUserRepository) Update(ctx context.Context, id int64, name, email string) (*User, error) {
-	const q = `UPDATE users SET name = $1, email = $2 WHERE id = $3 RETURNING id, name, email, created_at`
+func (r *pgUserRepository) Update(ctx context.Context, id int64, name, email string, version int64) (*User, error) {
+	// The version predicate makes the write conditional: a concurrent
+	// committed Update bumps version, so a caller holding the old value
+	// matches zero rows instead of silently overwriting (lost update).
+	const q = `UPDATE users SET name = $1, email = $2, version = version + 1
+	           WHERE id = $3 AND version = $4
+	           RETURNING id, name, email, version, created_at`
 
 	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
 	defer cancel()
 
 	u := &User{}
-	err := r.pool.QueryRow(ctx, q, name, email, id).Scan(&u.ID, &u.Name, &u.Email, &u.CreatedAt)
+	err := r.pool.QueryRow(ctx, q, name, email, id, version).Scan(&u.ID, &u.Name, &u.Email, &u.Version, &u.CreatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
+			// Zero rows means either the row is gone or the version is
+			// stale — distinguish so the API can return 404 vs 409.
+			var exists bool
+			if exErr := r.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM users WHERE id = $1)`, id).Scan(&exists); exErr != nil {
+				return nil, fmt.Errorf("check user existence: %w", exErr)
+			}
+			if exists {
+				return nil, ErrVersionConflict
+			}
 			return nil, ErrNotFound
 		}
 		var pgErr *pgconn.PgError

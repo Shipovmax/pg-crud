@@ -53,7 +53,7 @@ func (f *countingUserRepository) List(_ context.Context, _, _ int) ([]*User, err
 	return nil, errors.New("not implemented")
 }
 
-func (f *countingUserRepository) Update(_ context.Context, _ int64, name, email string) (*User, error) {
+func (f *countingUserRepository) Update(_ context.Context, _ int64, name, email string, _ int64) (*User, error) {
 	if f.updateErr != nil {
 		return nil, f.updateErr
 	}
@@ -244,7 +244,7 @@ func TestUpdate_InvalidatesCacheOnlyAfterCommit(t *testing.T) {
 	waitForCachedKey(t, repo, 9)
 
 	next.updateErr = errors.New("db down")
-	if _, err := repo.Update(ctx, 9, "Ann2", "ann2@example.com"); err == nil {
+	if _, err := repo.Update(ctx, 9, "Ann2", "ann2@example.com", 1); err == nil {
 		t.Fatal("expected Update to fail")
 	}
 	if !mr.Exists(userCacheKey(9)) {
@@ -252,7 +252,7 @@ func TestUpdate_InvalidatesCacheOnlyAfterCommit(t *testing.T) {
 	}
 
 	next.updateErr = nil
-	if _, err := repo.Update(ctx, 9, "Ann3", "ann3@example.com"); err != nil {
+	if _, err := repo.Update(ctx, 9, "Ann3", "ann3@example.com", 1); err != nil {
 		t.Fatalf("Update: %v", err)
 	}
 	if mr.Exists(userCacheKey(9)) {

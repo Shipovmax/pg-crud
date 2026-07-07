@@ -30,7 +30,7 @@ func (f *fakeUserRepository) Create(_ context.Context, name, email string) (*rep
 		}
 	}
 	f.nextID++
-	u := &repository.User{ID: f.nextID, Name: name, Email: email, CreatedAt: time.Now()}
+	u := &repository.User{ID: f.nextID, Name: name, Email: email, Version: 1, CreatedAt: time.Now()}
 	f.users[u.ID] = u
 	return u, nil
 }
@@ -57,10 +57,13 @@ func (f *fakeUserRepository) List(_ context.Context, limit, offset int) ([]*repo
 	return users, nil
 }
 
-func (f *fakeUserRepository) Update(_ context.Context, id int64, name, email string) (*repository.User, error) {
+func (f *fakeUserRepository) Update(_ context.Context, id int64, name, email string, version int64) (*repository.User, error) {
 	u, ok := f.users[id]
 	if !ok {
 		return nil, repository.ErrNotFound
+	}
+	if u.Version != version {
+		return nil, repository.ErrVersionConflict
 	}
 	for otherID, other := range f.users {
 		if otherID != id && other.Email == email {
@@ -69,6 +72,7 @@ func (f *fakeUserRepository) Update(_ context.Context, id int64, name, email str
 	}
 	u.Name = name
 	u.Email = email
+	u.Version++
 	return u, nil
 }
 
@@ -156,14 +160,35 @@ func TestUpdate(t *testing.T) {
 	h, repo := newTestHandler()
 	u, _ := repo.Create(context.Background(), "Alice", "alice@example.com")
 
-	rec := doRequest(h.Update, http.MethodPut, "/users/"+itoa(u.ID), updateUserRequest{Name: "Alice2", Email: "alice2@example.com"}, itoa(u.ID))
+	rec := doRequest(h.Update, http.MethodPut, "/users/"+itoa(u.ID), updateUserRequest{Name: "Alice2", Email: "alice2@example.com", Version: 1}, itoa(u.ID))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("got status %d, want %d, body: %s", rec.Code, http.StatusOK, rec.Body.String())
 	}
 
-	rec = doRequest(h.Update, http.MethodPut, "/users/999", updateUserRequest{Name: "X", Email: "x@example.com"}, "999")
+	rec = doRequest(h.Update, http.MethodPut, "/users/999", updateUserRequest{Name: "X", Email: "x@example.com", Version: 1}, "999")
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("got status %d, want %d", rec.Code, http.StatusNotFound)
+	}
+}
+
+func TestUpdateVersionConflict(t *testing.T) {
+	h, repo := newTestHandler()
+	u, _ := repo.Create(context.Background(), "Alice", "alice@example.com")
+
+	// First writer bumps version 1 -> 2; second writer still holds 1.
+	rec := doRequest(h.Update, http.MethodPut, "/users/"+itoa(u.ID), updateUserRequest{Name: "A2", Email: "a2@example.com", Version: 1}, itoa(u.ID))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first update: got status %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	rec = doRequest(h.Update, http.MethodPut, "/users/"+itoa(u.ID), updateUserRequest{Name: "A3", Email: "a3@example.com", Version: 1}, itoa(u.ID))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("stale update: got status %d, want %d", rec.Code, http.StatusConflict)
+	}
+
+	rec = doRequest(h.Update, http.MethodPut, "/users/"+itoa(u.ID), updateUserRequest{Name: "A3", Email: "a3@example.com"}, itoa(u.ID))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("missing version: got status %d, want %d", rec.Code, http.StatusBadRequest)
 	}
 }
 
