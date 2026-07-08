@@ -92,7 +92,9 @@ func newTestHandler() (*UserHandler, *fakeUserRepository) {
 func doRequest(h http.HandlerFunc, method, target string, body any, idParam string) *httptest.ResponseRecorder {
 	var buf bytes.Buffer
 	if body != nil {
-		json.NewEncoder(&buf).Encode(body)
+		if err := json.NewEncoder(&buf).Encode(body); err != nil {
+			panic(err) // test fixture construction, not a request under test
+		}
 	}
 	req := httptest.NewRequest(method, target, &buf)
 	if idParam != "" {
@@ -210,7 +212,9 @@ func TestDelete(t *testing.T) {
 func TestList(t *testing.T) {
 	h, repo := newTestHandler()
 	for i := range 3 {
-		repo.Create(context.Background(), "User"+itoa(int64(i)), "user"+itoa(int64(i))+"@example.com")
+		if _, err := repo.Create(context.Background(), "User"+itoa(int64(i)), "user"+itoa(int64(i))+"@example.com"); err != nil {
+			t.Fatalf("seed user %d: %v", i, err)
+		}
 	}
 
 	rec := doRequest(h.List, http.MethodGet, "/users?limit=2&offset=1", nil, "")

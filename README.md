@@ -27,7 +27,7 @@ This is exactly the type of project where most junior developers make critical m
 ### Stack
 
 - Language: Go 1.25
-- Dependencies: `pgx/v5`, `golang-migrate/migrate/v4`, `redis/go-redis/v9`, `sony/gobreaker`, `golang.org/x/sync/singleflight`, `prometheus/client_golang`
+- Dependencies: `pgx/v5`, `golang-migrate/migrate/v4`, `redis/go-redis/v9`, `sony/gobreaker`, `golang.org/x/sync/singleflight`, `prometheus/client_golang`, `go.opentelemetry.io/otel`, `testcontainers-go` (integration tests only)
 - Infrastructure: PostgreSQL 16, Redis 7, Docker
 - Platform: Linux/macOS
 
@@ -93,32 +93,52 @@ go run ./...
 
 ```
 
-Optional environment variables (defaults in parentheses): `SERVER_ADDR` (`:8080`), `POOL_MAX_CONNS` (`10`), `REDIS_ADDR` (`localhost:6379`), `REDIS_POOL_SIZE` (`10`), `REDIS_MIN_IDLE_CONNS` (`2`), `CACHE_TTL_SECONDS` (`60`), `BREAKER_THRESHOLD` (`5`), `BREAKER_COOLDOWN_SECONDS` (`30`).
+Optional environment variables (defaults in parentheses): `SERVER_ADDR` (`:8080`), `POOL_MAX_CONNS` (`10`), `REDIS_ADDR` (`localhost:6379`), `REDIS_POOL_SIZE` (`10`), `REDIS_MIN_IDLE_CONNS` (`2`), `CACHE_TTL_SECONDS` (`60`), `BREAKER_THRESHOLD` (`5`), `BREAKER_COOLDOWN_SECONDS` (`30`), `API_KEYS` (comma-separated; unset disables auth — logged loudly at startup, not a silent default), `OTEL_EXPORTER_ENDPOINT` (unset exports traces to stdout instead of an OTLP collector).
 
 Operational endpoints: `/metrics` (Prometheus), `/healthz` (liveness), `/readyz` (readiness — requires Postgres; a degraded Redis is reported but does not fail readiness, since the cache layer fails open).
 
+`/users/*` requires an `X-API-Key` header matching one of `API_KEYS` (constant-time comparison); `/healthz`, `/readyz` and `/metrics` are unauthenticated.
+
+### Testing
+
+```bash
+# Unit tests (fakes + miniredis, no external services)
+go test -race ./...
+
+# Integration tests against a real Postgres container (needs Docker)
+go test -tags=integration -race ./repository/...
+
+# Static analysis
+golangci-lint run ./...
+
+```
+
 ### Usage
+
+If `API_KEYS` is set, every `/users/*` call below needs `-H "X-API-Key: <one of API_KEYS>"`.
 
 ```bash
 # Create a user
 curl -X POST http://localhost:8080/users \
   -H "Content-Type: application/json" \
+  -H "X-API-Key: dev-key" \
   -d '{"name":"Alice","email":"alice@example.com"}'
 
 # Get a user by ID
-curl http://localhost:8080/users/1
+curl -H "X-API-Key: dev-key" http://localhost:8080/users/1
 
 # List users (paginated, limit <= 100)
-curl "http://localhost:8080/users?limit=20&offset=0"
+curl -H "X-API-Key: dev-key" "http://localhost:8080/users?limit=20&offset=0"
 
 # Update a user — version implements optimistic locking: send the version
 # you read; a stale version yields 409 instead of a silent lost update
 curl -X PUT http://localhost:8080/users/1 \
   -H "Content-Type: application/json" \
+  -H "X-API-Key: dev-key" \
   -d '{"name":"Alice Updated","email":"alice@example.com","version":1}'
 
 # Delete a user
-curl -X DELETE http://localhost:8080/users/1
+curl -X DELETE -H "X-API-Key: dev-key" http://localhost:8080/users/1
 
 ```
 
@@ -159,6 +179,9 @@ POST /users (empty email) → 400 {"error":"email is required"}
 
 # Stale optimistic-lock version (concurrent update won)
 PUT /users/1 (old version) → 409 {"error":"version conflict"}
+
+# Missing or wrong API key (only when API_KEYS is set)
+any /users/* request → 401 {"error":"invalid or missing API key"}
 
 # Database connectivity failure
 any request → 503 {"error":"service unavailable"}

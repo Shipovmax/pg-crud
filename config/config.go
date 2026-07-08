@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -20,6 +21,16 @@ type Config struct {
 	CacheTTL          time.Duration
 	BreakerThreshold  uint32
 	BreakerCooldown   time.Duration
+
+	// APIKeys is the set of accepted X-API-Key values. Empty means
+	// authentication is disabled — acceptable for local development,
+	// the caller (main) must log this loudly rather than fail silently.
+	APIKeys map[string]struct{}
+
+	// OTelExporterEndpoint is the OTLP/gRPC collector address. Empty
+	// falls back to a stdout exporter, so tracing is observable locally
+	// without standing up a collector.
+	OTelExporterEndpoint string
 }
 
 // Load reads configuration from environment variables and validates it.
@@ -73,6 +84,17 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
+	apiKeys := make(map[string]struct{})
+	if v := os.Getenv("API_KEYS"); v != "" {
+		for key := range strings.SplitSeq(v, ",") {
+			key = strings.TrimSpace(key)
+			if key == "" {
+				continue
+			}
+			apiKeys[key] = struct{}{}
+		}
+	}
+
 	return &Config{
 		DatabaseURL:  dsn,
 		ServerAddr:   addr,
@@ -84,6 +106,9 @@ func Load() (*Config, error) {
 		CacheTTL:          time.Duration(cacheTTLSeconds) * time.Second,
 		BreakerThreshold:  uint32(breakerThreshold),
 		BreakerCooldown:   time.Duration(breakerCooldownSeconds) * time.Second,
+
+		APIKeys:              apiKeys,
+		OTelExporterEndpoint: os.Getenv("OTEL_EXPORTER_ENDPOINT"),
 	}, nil
 }
 

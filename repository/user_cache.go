@@ -11,11 +11,17 @@ import (
 
 	"github.com/redis/go-redis/v9"
 	"github.com/sony/gobreaker"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/singleflight"
 
 	"pg-crud/logging"
 	"pg-crud/metrics"
 )
+
+var cacheTracer = otel.Tracer("pg-crud/cache")
 
 // cacheOpTimeout bounds every individual Redis round-trip. It is
 // deliberately far below the Postgres query timeout so a degraded cache
@@ -105,7 +111,7 @@ func (r *cachedUserRepository) GetByID(ctx context.Context, id int64) (*User, er
 		if err != nil {
 			return nil, err
 		}
-		r.setAsync(u)
+		r.setAsync(u) //nolint:contextcheck // detached by design: the background cache warm-up must outlive the request context
 		return u, nil
 	})
 	if err != nil {
@@ -139,7 +145,17 @@ func (r *cachedUserRepository) Delete(ctx context.Context, id int64) error {
 // returned error is either redis.Nil (true cache miss), a gobreaker
 // sentinel (breaker refused to even attempt the call), or a transport
 // error — callers distinguish redis.Nil from everything else.
-func (r *cachedUserRepository) getFromCache(ctx context.Context, key string) ([]byte, error) {
+func (r *cachedUserRepository) getFromCache(ctx context.Context, key string) (data []byte, err error) {
+	ctx, span := cacheTracer.Start(ctx, "cache.Get", trace.WithAttributes(attribute.String("cache.key", key)))
+	defer func() {
+		// redis.Nil is an expected cache miss, not a span-level failure;
+		// everything else (breaker open, timeout, transport) is a real error.
+		if err != nil && !errors.Is(err, redis.Nil) {
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
+
 	v, err := r.breaker.Execute(func() (any, error) {
 		cacheCtx, cancel := context.WithTimeout(ctx, cacheOpTimeout)
 		defer cancel()
@@ -156,12 +172,16 @@ func (r *cachedUserRepository) getFromCache(ctx context.Context, key string) ([]
 // breaker, so a degraded Redis adds at most one bounded delay to a
 // write request instead of hanging it.
 func (r *cachedUserRepository) invalidate(ctx context.Context, id int64) {
+	ctx, span := cacheTracer.Start(ctx, "cache.Del", trace.WithAttributes(attribute.Int64("user_id", id)))
+	defer span.End()
+
 	_, err := r.breaker.Execute(func() (any, error) {
 		cacheCtx, cancel := context.WithTimeout(ctx, cacheOpTimeout)
 		defer cancel()
 		return nil, r.redis.Del(cacheCtx, userCacheKey(id)).Err()
 	})
 	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
 		logging.FromContext(ctx).Warn("cache invalidate failed", "user_id", id, "error", err)
 		r.metrics.Errors.Inc()
 	}
@@ -181,13 +201,21 @@ func (r *cachedUserRepository) setAsync(u *User) {
 	}
 
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), cacheOpTimeout)
+		// Its own root span, not a child of the request span: this work
+		// outlives the request by design, so parenting it to a span that
+		// may already have ended would misrepresent the trace.
+		ctx, span := cacheTracer.Start(context.Background(), "cache.setAsync",
+			trace.WithAttributes(attribute.Int64("user_id", u.ID)))
+		defer span.End()
+
+		ctx, cancel := context.WithTimeout(ctx, cacheOpTimeout)
 		defer cancel()
 
 		_, err := r.breaker.Execute(func() (any, error) {
 			return nil, r.redis.Set(ctx, userCacheKey(u.ID), payload, r.jitteredTTL()).Err()
 		})
 		if err != nil {
+			span.SetStatus(codes.Error, err.Error())
 			// Detached from the request, so no trace_id here by design.
 			slog.Default().Warn("cache set failed", "user_id", u.ID, "error", err)
 			r.metrics.Errors.Inc()

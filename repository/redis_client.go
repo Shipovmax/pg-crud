@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -40,10 +41,8 @@ func NewRedisClient(ctx context.Context, cfg RedisConfig) (*redis.Client, error)
 	defer cancel()
 
 	if err := client.Ping(pingCtx).Err(); err != nil {
-		if closeErr := client.Close(); closeErr != nil {
-			return nil, fmt.Errorf("redis ping: %w (close: %v)", err, closeErr)
-		}
-		return nil, fmt.Errorf("redis ping: %w", err)
+		closeErr := client.Close()
+		return nil, fmt.Errorf("redis ping: %w", errors.Join(err, closeErr))
 	}
 	return client, nil
 }

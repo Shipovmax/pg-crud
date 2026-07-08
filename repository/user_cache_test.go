@@ -80,7 +80,11 @@ func newTestCache(t *testing.T, next UserRepository, ttl time.Duration) (*cached
 	t.Helper()
 	mr := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
-	t.Cleanup(func() { rdb.Close() })
+	t.Cleanup(func() {
+		if err := rdb.Close(); err != nil {
+			t.Logf("close redis client: %v", err)
+		}
+	})
 
 	m := metrics.NewCacheMetrics(prometheus.NewRegistry())
 	repo := NewCachedUserRepository(next, rdb, ttl, BreakerConfig{Threshold: 3, Cooldown: 50 * time.Millisecond}, m)
@@ -163,7 +167,11 @@ func TestGetByID_FailsOpenWhenRedisUnreachable(t *testing.T) {
 	// 127.0.0.1:1 refuses the connection immediately instead of hanging,
 	// simulating "Redis is down" without waiting out a dial timeout.
 	rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1", DialTimeout: 100 * time.Millisecond})
-	t.Cleanup(func() { rdb.Close() })
+	t.Cleanup(func() {
+		if err := rdb.Close(); err != nil {
+			t.Logf("close redis client: %v", err)
+		}
+	})
 
 	m := metrics.NewCacheMetrics(prometheus.NewRegistry())
 	repo := NewCachedUserRepository(next, rdb, time.Minute, BreakerConfig{Threshold: 100, Cooldown: time.Second}, m).(*cachedUserRepository)
@@ -183,7 +191,11 @@ func TestGetByID_FailsOpenWhenRedisUnreachable(t *testing.T) {
 func TestCircuitBreaker_OpensAfterThresholdAndSkipsRedis(t *testing.T) {
 	next := &countingUserRepository{user: &User{ID: 5, Name: "Sam", Email: "sam@example.com"}}
 	rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1", DialTimeout: 20 * time.Millisecond})
-	t.Cleanup(func() { rdb.Close() })
+	t.Cleanup(func() {
+		if err := rdb.Close(); err != nil {
+			t.Logf("close redis client: %v", err)
+		}
+	})
 
 	reg := prometheus.NewRegistry()
 	m := metrics.NewCacheMetrics(reg)

@@ -17,5 +17,19 @@ jobs:
         run: test -z "$(gofmt -l .)"
       - name: vet
         run: go vet ./...
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
       - name: test
         run: go test -race ./...
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: integration test (real Postgres via testcontainers)
+        run: go test -tags=integration -race ./repository/...

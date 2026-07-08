@@ -1,0 +1,24 @@
+version: "2"
+
+linters:
+  enable:
+    - bodyclose
+    - contextcheck
+    - errorlint
+    - gocritic
+    - govet
+    - misspell
+    - nilerr
+    - revive
+    - unconvert
+    - unparam
+  settings:
+    revive:
+      rules:
+        - name: exported
+          disabled: true # godoc comments are enforced by review, not by this linter
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

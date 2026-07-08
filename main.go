@@ -23,6 +23,7 @@ import (
 	"pg-crud/metrics"
 	"pg-crud/middleware"
 	"pg-crud/repository"
+	"pg-crud/tracing"
 )
 
 // fatal logs the startup error and exits: these run before the server
@@ -41,6 +42,18 @@ func main() {
 	}
 
 	ctx := context.Background()
+
+	tp, err := tracing.NewTracerProvider(ctx, cfg.OTelExporterEndpoint, "pg-crud")
+	if err != nil {
+		fatal("tracing", err)
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := tp.Shutdown(shutdownCtx); err != nil {
+			slog.Error("shutdown tracer provider", "error", err)
+		}
+	}()
 
 	poolCfg, err := pgxpool.ParseConfig(cfg.DatabaseURL)
 	if err != nil {
@@ -67,7 +80,11 @@ func main() {
 	if err != nil {
 		fatal("redis", err)
 	}
-	defer redisClient.Close()
+	defer func() {
+		if err := redisClient.Close(); err != nil {
+			slog.Error("close redis client", "error", err)
+		}
+	}()
 
 	cacheMetrics := metrics.NewCacheMetrics(prometheus.DefaultRegisterer)
 	httpMetrics := metrics.NewHTTPMetrics(prometheus.DefaultRegisterer)
@@ -80,12 +97,17 @@ func main() {
 
 	userHandler := handler.NewUserHandler(cachedRepo)
 
+	if len(cfg.APIKeys) == 0 {
+		slog.Warn("API_KEYS not set: /users endpoints are unauthenticated")
+	}
+	auth := middleware.Authenticate(cfg.APIKeys)
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /users", userHandler.Create)
-	mux.HandleFunc("GET /users", userHandler.List)
-	mux.HandleFunc("GET /users/{id}", userHandler.GetByID)
-	mux.HandleFunc("PUT /users/{id}", userHandler.Update)
-	mux.HandleFunc("DELETE /users/{id}", userHandler.Delete)
+	mux.HandleFunc("POST /users", auth(userHandler.Create))
+	mux.HandleFunc("GET /users", auth(userHandler.List))
+	mux.HandleFunc("GET /users/{id}", auth(userHandler.GetByID))
+	mux.HandleFunc("PUT /users/{id}", auth(userHandler.Update))
+	mux.HandleFunc("DELETE /users/{id}", auth(userHandler.Delete))
 	mux.Handle("/metrics", promhttp.Handler())
 
 	// Liveness: the process is up and serving. No dependency checks —
