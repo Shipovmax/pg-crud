@@ -1,6 +1,6 @@
 # pg-crud — PostgreSQL CRUD Service
 
-> HTTP REST service featuring comprehensive PostgreSQL integration: connection pooling, migrations, and transactions. Project #7 in the Go backend roadmap — first hands-on experience with persistent storage.
+> HTTP REST service featuring comprehensive PostgreSQL integration: connection pooling, migrations, and optimistic concurrency control. Project #7 in the Go backend roadmap — first hands-on experience with persistent storage.
 
 ---
 
@@ -8,7 +8,7 @@
 
 ### What this is and why
 
-pg-crud is an HTTP service for managing entity records (users) backed by PostgreSQL. Following the in-memory kv-store (#6), Project #7 introduces persistent storage with a production-grade setup: connection pooling via `pgxpool`, raw SQL migrations, and explicit transaction management where atomicity is required.
+pg-crud is an HTTP service for managing entity records (users) backed by PostgreSQL. Following the in-memory kv-store (#6), Project #7 introduces persistent storage with a production-grade setup: connection pooling via `pgxpool`, raw SQL migrations, and optimistic concurrency control where safe concurrent writes are required.
 
 This is exactly the type of project where most junior developers make critical mistakes: opening a new connection per request, ignoring rollback logic on errors, or bleeding SQL queries into business logic. Here, layers are strictly isolated: the repository layer encapsulates raw SQL, handlers deal exclusively with HTTP, and `main.go` only acts as wire-up.
 
@@ -18,7 +18,7 @@ This is exactly the type of project where most junior developers make critical m
 |-------|---------------|
 | Connection pooling | `pgxpool.New` with tuned `MaxConns` and `MinConns` configurations |
 | SQL migrations | `golang-migrate/migrate` — up/down SQL files with schema versioning |
-| Transactions | `pool.Begin()` → defer rollback → explicit commit pattern |
+| Optimistic concurrency | Version column + conditional `UPDATE ... WHERE version = $n`, no lost updates |
 | Repository pattern | SQL execution isolated in `repository/`; handlers remain agnostic to database queries |
 | Error handling | Proper mapping: `pgx.ErrNoRows` → 404, constraint violations → 409 Conflict |
 | Graceful shutdown | `http.Server.Shutdown` paired with clean connection pool termination |
@@ -49,17 +49,18 @@ Executing raw SQL strings directly within `db.Exec` upon application startup is 
 
 HTTP handlers should have no awareness of raw SQL queries. The repository layer is designed as the sole domain containing the `pgxpool.Pool` and raw SQL statement strings. Handlers interact with this layer strictly through the `UserRepository` interface. This architecture provides excellent testability (via mock repositories), absolute decoupling between business logic and storage, and the flexibility to switch database backends without modifying the HTTP transport layer.
 
-#### WHY defer tx.Rollback()
+#### WHY optimistic concurrency control instead of explicit transactions
 
 ```go
-tx, _ := pool.Begin(ctx)
-defer tx.Rollback(ctx) // no-op if Commit has already been executed
-// ... database operations ...
-tx.Commit(ctx)
-
+// version predicate makes the write conditional: a concurrent committed
+// Update bumps version, so a caller holding the old value matches zero
+// rows instead of silently overwriting (lost update)
+const q = `UPDATE users SET name = $1, email = $2, version = version + 1
+           WHERE id = $3 AND version = $4
+           RETURNING id, name, email, version, created_at`
 ```
 
-Calling `Rollback` after a successful `Commit` is a completely safe no-op operation. Utilizing this pattern guarantees that if an error or panic occurs midway through execution, the transaction will automatically roll back, preventing partial data state updates even if an explicit rollback statement was missed.
+Every write in this service is a single statement, and PostgreSQL guarantees atomicity per statement — there is no multi-statement unit of work here that would require `pool.Begin()`/`Commit()`/`Rollback()`. An earlier revision wrapped `Update` in an explicit transaction purely to re-check row existence after a failed conditional update; that transaction bought nothing (no second write to keep atomic with the first) and was dropped in favor of the `version` column driving the whole conflict-detection logic. Optimistic concurrency was chosen over row-level locking (`SELECT ... FOR UPDATE`) because writes here are infrequent relative to reads and contention is expected to be low — a stale `version` simply yields `409 Conflict` for the client to retry, instead of holding a lock for the duration of the request.
 
 ### Structure
 
